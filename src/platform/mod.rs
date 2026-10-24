@@ -18,5 +18,10 @@ mod pnp_detect_windows;
 #[cfg(target_os = "windows")]
 pub use pnp_detect_windows::PnPDetectWindows as PnPDetect;
 
+#[cfg(target_os = "macos")]
+mod display_serial;
+#[cfg(target_os = "macos")]
+pub use display_serial::display_serial;
+
 mod wake_displays;
 pub use wake_displays::wake_displays;

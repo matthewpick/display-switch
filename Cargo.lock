@@ -451,6 +451,7 @@ dependencies = [
  "anyhow",
  "clap",
  "config",
+ "core-foundation",
  "ddc",
  "ddc-hi",
  "ddc-i2c",

@@ -16,6 +16,24 @@ use std::{thread, time};
 const INPUT_SELECT: u8 = 0x60;
 const RETRY_DELAY_MS: u64 = 3000;
 
+/// Qualify a macOS display name with its EDID serial number, so that identical monitors
+/// (which report the same `DisplayProductName`) can be told apart.
+///
+/// The serial is left out when it is absent, zero (which displays report when they have none),
+/// or already part of the name, so that monitors naming themselves "LEN P27u-10 S/N 1144206897"
+/// are not given the same number twice.
+#[cfg(target_os = "macos")]
+fn macos_display_id(id: &str, serial: Option<u32>) -> String {
+    let serial = serial
+        .filter(|serial| *serial != 0)
+        .map(|serial| serial.to_string())
+        .filter(|serial| !id.contains(serial.as_str()));
+    std::iter::once(id)
+        .chain(serial.as_deref())
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
 fn display_name(display: &Display, index: Option<usize>) -> String {
     // Different OSes populate different fields of ddc-hi-rs info structure differently. Create
     // a synthetic "display_name" that makes sense on each OS
@@ -31,7 +49,7 @@ fn display_name(display: &Display, index: Option<usize>) -> String {
     .collect::<Vec<&str>>()
     .join(" ");
     #[cfg(target_os = "macos")]
-    let display_id = &display.info.id;
+    let display_id = macos_display_id(&display.info.id, crate::platform::display_serial(display));
     #[cfg(target_os = "windows")]
     let display_id = &display.info.id;
 
@@ -181,4 +199,29 @@ fn run_command(execute_command: &str) {
 
     try_run_command(execute_command)
         .unwrap_or_else(|err| error!("Error executing external command '{}': {}", execute_command, err))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::macos_display_id;
+
+    #[test]
+    fn identical_monitors_are_told_apart_by_serial() {
+        assert_eq!(macos_display_id("PHL 279P1", Some(2667)), "PHL 279P1 2667");
+        assert_eq!(macos_display_id("PHL 279P1", Some(1126)), "PHL 279P1 1126");
+    }
+
+    #[test]
+    fn serial_already_in_the_name_is_not_repeated() {
+        assert_eq!(
+            macos_display_id("LEN P27u-10 S/N 1144206897", Some(1144206897)),
+            "LEN P27u-10 S/N 1144206897"
+        );
+    }
+
+    #[test]
+    fn missing_serial_leaves_the_name_alone() {
+        assert_eq!(macos_display_id("PHL 279P1", None), "PHL 279P1");
+        assert_eq!(macos_display_id("PHL 279P1", Some(0)), "PHL 279P1");
+    }
 }

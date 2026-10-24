@@ -68,6 +68,31 @@ on_usb_connect = "hdmi2"
 `LEN P27u-10 S/N 1144206897` monitor ID. If more than one section has a match, a first one will be used.
 `on_usb_connect` and `on_usb_disconnect`, if defined, take precedence over global defaults.
 
+To find the monitor IDs, run `display_switch` and look at the log: it reports every display it found at startup, as
+`Display '...' is currently set to ...`.
+
+_Tips for MacOS_: monitor IDs include the monitor's EDID serial number, so that identical monitors (which report the
+same name to MacOS) can be told apart. Two Philips monitors both named `PHL 279P1` are reported as `PHL 279P1 2667`
+and `PHL 279P1 1126`, and `monitor_id = "2667"` then always matches the same physical monitor:
+
+```ini
+[monitor1]
+monitor_id = "2667"
+on_usb_connect = "DisplayPort2"
+
+[monitor2]
+monitor_id = "1126"
+on_usb_connect = "Hdmi2"
+```
+
+The serial number is omitted if the monitor does not report one, or if it is already part of the monitor's name.
+Monitors whose IDs are still identical keep being distinguished by a trailing ` #1`, ` #2` etc., as before, but note
+that this ordering is not stable between runs: prefer matching on the serial number where there is one.
+
+This is a change in behaviour on MacOS: identical monitors used to be distinguished only by that trailing ` #1` /
+` #2`. A configuration matching on `monitor_id = "#1"` no longer matches a monitor that reports a serial number, and
+has to be changed to match on the serial number instead.
+
 _Tips for Windows_: monitors can be renamed in the Registry at
 `\HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\DISPLAY\{MODEL_ID}\{CONNECTION_ID}`. Edit the `DeviceDesc` value and change the name after the last semicolon. This is especially helpful in case they are all just "Generic PnP Monitor".
 
