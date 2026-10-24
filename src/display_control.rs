@@ -16,6 +16,19 @@ use std::{thread, time};
 const INPUT_SELECT: u8 = 0x60;
 const RETRY_DELAY_MS: u64 = 3000;
 
+/// How many times the input is written before giving up. Some displays acknowledge a write
+/// and then ignore it: a Philips 279P1 connected over USB-C does this consistently.
+const MAX_SWITCH_ATTEMPTS: u32 = 3;
+/// How long to wait after writing the input before reading it back. Measured on a Philips
+/// 279P1: a read issued immediately after the write always fails with "invalid DDC/CI length",
+/// while one issued about 60ms later succeeds.
+const SETTLE_DELAY: time::Duration = time::Duration::from_millis(50);
+/// How many times the input is read back before concluding that the write cannot be verified.
+/// Reads on this hardware fail intermittently, so a single failure means very little.
+const MAX_VERIFY_READS: u32 = 3;
+/// How long to wait between those read-backs. A read itself takes about 50ms.
+const VERIFY_READ_DELAY: time::Duration = time::Duration::from_millis(25);
+
 /// Qualify a macOS display name with its EDID serial number, so that identical monitors
 /// (which report the same `DisplayProductName`) can be told apart.
 ///
@@ -65,27 +78,115 @@ fn are_display_names_unique(displays: &[Display]) -> bool {
     displays.iter().all(|display| hash.insert(display_name(display, None)))
 }
 
-fn try_switch_display(handle: &mut Handle, display_name: &str, input: InputSource) {
-    match handle.get_vcp_feature(INPUT_SELECT) {
-        Ok(raw_source) => {
-            if raw_source.value() & 0xff == input.value() {
-                info!("Display {} is already set to {}", display_name, input);
+/// The display operations needed to switch an input, so that the retry logic below can be
+/// exercised without a real display.
+trait InputControl {
+    fn get_input(&mut self) -> Result<u16>;
+    fn set_input(&mut self, input: u16) -> Result<()>;
+    fn wait(&mut self, delay: time::Duration);
+}
+
+struct DdcInputControl<'a> {
+    handle: &'a mut Handle,
+}
+
+impl InputControl for DdcInputControl<'_> {
+    fn get_input(&mut self) -> Result<u16> {
+        Ok(self.handle.get_vcp_feature(INPUT_SELECT)?.value() & 0xff)
+    }
+
+    fn set_input(&mut self, input: u16) -> Result<()> {
+        self.handle.set_vcp_feature(INPUT_SELECT, input)
+    }
+
+    fn wait(&mut self, delay: time::Duration) {
+        thread::sleep(delay)
+    }
+}
+
+/// What reading the input back after a write told us.
+enum Verification {
+    /// The display reports the requested input.
+    Confirmed(time::Duration),
+    /// The display acknowledged the write but still reports something else.
+    Ignored(u16),
+    /// The input could not be read back at all.
+    Unknown,
+}
+
+fn verify_input(control: &mut impl InputControl, display_name: &str, input: InputSource) -> Verification {
+    let started = time::Instant::now();
+    control.wait(SETTLE_DELAY);
+    for read in 1..=MAX_VERIFY_READS {
+        match control.get_input() {
+            Ok(current) if current == input.value() => return Verification::Confirmed(started.elapsed()),
+            Ok(current) => return Verification::Ignored(current),
+            Err(err) => debug!(
+                "Failed to read back the input of display {} ({:?}), read {} of {}",
+                display_name, err, read, MAX_VERIFY_READS
+            ),
+        }
+        if read < MAX_VERIFY_READS {
+            control.wait(VERIFY_READ_DELAY);
+        }
+    }
+    Verification::Unknown
+}
+
+fn switch_input(control: &mut impl InputControl, display_name: &str, input: InputSource) {
+    match control.get_input() {
+        Ok(current) if current == input.value() => {
+            info!("Display {} is already set to {}", display_name, input);
+            return;
+        }
+        Ok(_) => (),
+        Err(err) => warn!("Failed to get current input for display {}: {:?}", display_name, err),
+    }
+
+    for attempt in 1..=MAX_SWITCH_ATTEMPTS {
+        debug!(
+            "Setting display {} to {} (attempt {} of {})",
+            display_name, input, attempt, MAX_SWITCH_ATTEMPTS
+        );
+        if let Err(err) = control.set_input(input.value()) {
+            error!("Failed to set display {} to {} ({:?})", display_name, input, err);
+            return;
+        }
+        match verify_input(control, display_name, input) {
+            Verification::Confirmed(elapsed) => {
+                debug!("Display {} reported {} after {:?}", display_name, input, elapsed);
+                if attempt == 1 {
+                    info!("Display {} set to {}", display_name, input);
+                } else {
+                    info!("Display {} set to {} on attempt {}", display_name, input, attempt);
+                }
+                return;
+            }
+            Verification::Ignored(current) => warn!(
+                "Display {} acknowledged being set to {} but still reports {:#x} (attempt {} of {})",
+                display_name, input, current, attempt, MAX_SWITCH_ATTEMPTS
+            ),
+            Verification::Unknown => {
+                // The input cannot be read back, which also happens when the switch worked and
+                // the display is already dropping off. Write once more, which is what m1ddc does
+                // unconditionally, rather than retrying blind.
+                if let Err(err) = control.set_input(input.value()) {
+                    error!("Failed to set display {} to {} ({:?})", display_name, input, err);
+                    return;
+                }
+                info!("Display {} set to {}, could not verify", display_name, input);
                 return;
             }
         }
-        Err(err) => {
-            warn!("Failed to get current input for display {}: {:?}", display_name, err);
-        }
     }
-    debug!("Setting display {} to {}", display_name, input);
-    match handle.set_vcp_feature(INPUT_SELECT, input.value()) {
-        Ok(_) => {
-            info!("Display {} set to {}", display_name, input);
-        }
-        Err(err) => {
-            error!("Failed to set display {} to {} ({:?})", display_name, input, err);
-        }
-    }
+    error!(
+        "Display {} did not accept being set to {} after {} attempts",
+        display_name, input, MAX_SWITCH_ATTEMPTS
+    );
+}
+
+fn try_switch_display(handle: &mut Handle, display_name: &str, input: InputSource) {
+    switch_input(&mut DdcInputControl { handle }, display_name, input)
 }
 
 fn displays() -> Vec<Display> {
@@ -202,7 +303,7 @@ fn run_command(execute_command: &str) {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+mod naming_tests {
     use super::macos_display_id;
 
     #[test]
@@ -223,5 +324,104 @@ mod tests {
     fn missing_serial_leaves_the_name_alone() {
         assert_eq!(macos_display_id("PHL 279P1", None), "PHL 279P1");
         assert_eq!(macos_display_id("PHL 279P1", Some(0)), "PHL 279P1");
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    const TARGET: u16 = 0x11;
+    const OTHER: u16 = 0x10;
+
+    /// A display whose read-backs are scripted: `Some(value)` is reported, `None` fails.
+    /// Once the script runs out, `settled` is reported instead.
+    struct FakeDisplay {
+        reads: VecDeque<Option<u16>>,
+        settled: Option<u16>,
+        writes: Vec<u16>,
+    }
+
+    impl FakeDisplay {
+        fn new(reads: Vec<Option<u16>>, settled: Option<u16>) -> Self {
+            Self {
+                reads: reads.into(),
+                settled,
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl InputControl for FakeDisplay {
+        fn get_input(&mut self) -> Result<u16> {
+            match self.reads.pop_front().unwrap_or(self.settled) {
+                Some(value) => Ok(value),
+                None => Err(Error::msg("invalid DDC/CI length")),
+            }
+        }
+
+        fn set_input(&mut self, input: u16) -> Result<()> {
+            self.writes.push(input);
+            Ok(())
+        }
+
+        fn wait(&mut self, _delay: time::Duration) {}
+    }
+
+    fn switch(display: &mut FakeDisplay) {
+        switch_input(display, "'Fake Display'", InputSource::Raw(TARGET))
+    }
+
+    #[test]
+    fn display_already_on_the_input_is_left_alone() {
+        let mut display = FakeDisplay::new(vec![Some(TARGET)], Some(TARGET));
+        switch(&mut display);
+        assert!(display.writes.is_empty(), "should not write to a display already set");
+    }
+
+    #[test]
+    fn write_verified_on_the_first_attempt() {
+        let mut display = FakeDisplay::new(vec![Some(OTHER), Some(TARGET)], Some(TARGET));
+        switch(&mut display);
+        assert_eq!(display.writes, vec![TARGET]);
+    }
+
+    #[test]
+    fn write_ignored_once_is_retried_then_verified() {
+        // Current input, then the display still reporting the old input, then accepting it.
+        let mut display = FakeDisplay::new(vec![Some(OTHER), Some(OTHER), Some(TARGET)], Some(TARGET));
+        switch(&mut display);
+        assert_eq!(display.writes, vec![TARGET, TARGET]);
+    }
+
+    #[test]
+    fn transient_read_failure_still_verifies() {
+        // A read issued right after the write fails on real hardware; the next one succeeds.
+        let mut display = FakeDisplay::new(vec![Some(OTHER), None, Some(TARGET)], Some(TARGET));
+        switch(&mut display);
+        assert_eq!(
+            display.writes,
+            vec![TARGET],
+            "a single failed read should not trigger another write"
+        );
+    }
+
+    #[test]
+    fn unreadable_display_gets_exactly_one_extra_write() {
+        let mut display = FakeDisplay::new(vec![Some(OTHER)], None);
+        switch(&mut display);
+        assert_eq!(
+            display.writes,
+            vec![TARGET, TARGET],
+            "should write once more, then stop rather than loop on read errors"
+        );
+    }
+
+    #[test]
+    fn display_that_keeps_ignoring_the_write_gives_up() {
+        let mut display = FakeDisplay::new(vec![Some(OTHER)], Some(OTHER));
+        switch(&mut display);
+        assert_eq!(display.writes.len(), MAX_SWITCH_ATTEMPTS as usize);
     }
 }

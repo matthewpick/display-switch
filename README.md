@@ -71,6 +71,10 @@ on_usb_connect = "hdmi2"
 To find the monitor IDs, run `display_switch` and look at the log: it reports every display it found at startup, as
 `Display '...' is currently set to ...`.
 
+Note that a comment cannot follow a value on the same line: `on_usb_connect = "Hdmi1" # Mac mini` fails at startup
+with `Invalid input source: hdmi1 # mac mini`, because the comment is read as part of the value. Keep comments on
+their own lines.
+
 _Tips for MacOS_: monitor IDs include the monitor's EDID serial number, so that identical monitors (which report the
 same name to MacOS) can be told apart. Two Philips monitors both named `PHL 279P1` are reported as `PHL 279P1 2667`
 and `PHL 279P1 1126`, and `monitor_id = "2667"` then always matches the same physical monitor:
