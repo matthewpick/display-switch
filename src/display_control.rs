@@ -19,6 +19,13 @@ const RETRY_DELAY_MS: u64 = 3000;
 /// How many times the input is written before giving up. Some displays acknowledge a write
 /// and then ignore it: a Philips 279P1 connected over USB-C does this consistently.
 const MAX_SWITCH_ATTEMPTS: u32 = 3;
+/// How long to wait before each write of the input. Both `m1ddc` and MonitorControl's
+/// `Arm64DDC` sleep this long before every write, and displays that ignore a switch tend to
+/// be the ones sent a write with no delay in front of it.
+const PRE_WRITE_DELAY: time::Duration = time::Duration::from_millis(10);
+/// How many times the input is written per attempt. `m1ddc` writes twice unconditionally
+/// (`DDC_ITERATIONS`), and MonitorControl defaults to two write cycles as well.
+const WRITE_CYCLES: u32 = 2;
 /// How long to wait after writing the input before reading it back. Measured on a Philips
 /// 279P1: a read issued immediately after the write always fails with "invalid DDC/CI length",
 /// while one issued about 60ms later succeeds.
@@ -114,6 +121,16 @@ enum Verification {
     Unknown,
 }
 
+/// Writes the input several times, as the displays that ignore a single write need, waiting
+/// before each write.
+fn write_input(control: &mut impl InputControl, input: InputSource) -> Result<()> {
+    for _ in 0..WRITE_CYCLES {
+        control.wait(PRE_WRITE_DELAY);
+        control.set_input(input.value())?;
+    }
+    Ok(())
+}
+
 fn verify_input(control: &mut impl InputControl, display_name: &str, input: InputSource) -> Verification {
     let started = time::Instant::now();
     control.wait(SETTLE_DELAY);
@@ -148,7 +165,7 @@ fn switch_input(control: &mut impl InputControl, display_name: &str, input: Inpu
             "Setting display {} to {} (attempt {} of {})",
             display_name, input, attempt, MAX_SWITCH_ATTEMPTS
         );
-        if let Err(err) = control.set_input(input.value()) {
+        if let Err(err) = write_input(control, input) {
             error!("Failed to set display {} to {} ({:?})", display_name, input, err);
             return;
         }
@@ -168,12 +185,9 @@ fn switch_input(control: &mut impl InputControl, display_name: &str, input: Inpu
             ),
             Verification::Unknown => {
                 // The input cannot be read back, which also happens when the switch worked and
-                // the display is already dropping off. Write once more, which is what m1ddc does
-                // unconditionally, rather than retrying blind.
-                if let Err(err) = control.set_input(input.value()) {
-                    error!("Failed to set display {} to {} ({:?})", display_name, input, err);
-                    return;
-                }
+                // the display is already dropping off. The input has already been written
+                // `WRITE_CYCLES` times, which is what m1ddc does unconditionally, so stop here
+                // rather than retrying blind.
                 info!("Display {} set to {}, could not verify", display_name, input);
                 return;
             }
@@ -341,6 +355,8 @@ mod switch_tests {
         reads: VecDeque<Option<u16>>,
         settled: Option<u16>,
         writes: Vec<u16>,
+        /// Everything the logic asked of the display, in order.
+        events: Vec<String>,
     }
 
     impl FakeDisplay {
@@ -349,13 +365,19 @@ mod switch_tests {
                 reads: reads.into(),
                 settled,
                 writes: Vec::new(),
+                events: Vec::new(),
             }
         }
     }
 
     impl InputControl for FakeDisplay {
         fn get_input(&mut self) -> Result<u16> {
-            match self.reads.pop_front().unwrap_or(self.settled) {
+            let value = self.reads.pop_front().unwrap_or(self.settled);
+            self.events.push(match value {
+                Some(value) => format!("read {:#04x}", value),
+                None => "read err".to_string(),
+            });
+            match value {
                 Some(value) => Ok(value),
                 None => Err(Error::msg("invalid DDC/CI length")),
             }
@@ -363,10 +385,13 @@ mod switch_tests {
 
         fn set_input(&mut self, input: u16) -> Result<()> {
             self.writes.push(input);
+            self.events.push(format!("write {:#04x}", input));
             Ok(())
         }
 
-        fn wait(&mut self, _delay: time::Duration) {}
+        fn wait(&mut self, delay: time::Duration) {
+            self.events.push(format!("wait {}ms", delay.as_millis()));
+        }
     }
 
     fn switch(display: &mut FakeDisplay) {
@@ -384,7 +409,26 @@ mod switch_tests {
     fn write_verified_on_the_first_attempt() {
         let mut display = FakeDisplay::new(vec![Some(OTHER), Some(TARGET)], Some(TARGET));
         switch(&mut display);
-        assert_eq!(display.writes, vec![TARGET]);
+        assert_eq!(display.writes.len(), WRITE_CYCLES as usize);
+    }
+
+    #[test]
+    fn every_write_is_preceded_by_a_wait() {
+        let mut display = FakeDisplay::new(vec![Some(OTHER), Some(TARGET)], Some(TARGET));
+        switch(&mut display);
+        assert_eq!(
+            display.events,
+            vec![
+                format!("read {:#04x}", OTHER),
+                "wait 10ms".to_string(),
+                format!("write {:#04x}", TARGET),
+                "wait 10ms".to_string(),
+                format!("write {:#04x}", TARGET),
+                "wait 50ms".to_string(),
+                format!("read {:#04x}", TARGET),
+            ],
+            "should write twice, waiting before each, then settle before reading back"
+        );
     }
 
     #[test]
@@ -392,7 +436,11 @@ mod switch_tests {
         // Current input, then the display still reporting the old input, then accepting it.
         let mut display = FakeDisplay::new(vec![Some(OTHER), Some(OTHER), Some(TARGET)], Some(TARGET));
         switch(&mut display);
-        assert_eq!(display.writes, vec![TARGET, TARGET]);
+        assert_eq!(
+            display.writes.len(),
+            2 * WRITE_CYCLES as usize,
+            "should make a second attempt"
+        );
     }
 
     #[test]
@@ -401,20 +449,20 @@ mod switch_tests {
         let mut display = FakeDisplay::new(vec![Some(OTHER), None, Some(TARGET)], Some(TARGET));
         switch(&mut display);
         assert_eq!(
-            display.writes,
-            vec![TARGET],
-            "a single failed read should not trigger another write"
+            display.writes.len(),
+            WRITE_CYCLES as usize,
+            "a failed read should not trigger another attempt"
         );
     }
 
     #[test]
-    fn unreadable_display_gets_exactly_one_extra_write() {
+    fn unreadable_display_is_written_but_not_retried() {
         let mut display = FakeDisplay::new(vec![Some(OTHER)], None);
         switch(&mut display);
         assert_eq!(
-            display.writes,
-            vec![TARGET, TARGET],
-            "should write once more, then stop rather than loop on read errors"
+            display.writes.len(),
+            WRITE_CYCLES as usize,
+            "should stop after one attempt rather than loop on read errors"
         );
     }
 
@@ -422,6 +470,6 @@ mod switch_tests {
     fn display_that_keeps_ignoring_the_write_gives_up() {
         let mut display = FakeDisplay::new(vec![Some(OTHER)], Some(OTHER));
         switch(&mut display);
-        assert_eq!(display.writes.len(), MAX_SWITCH_ATTEMPTS as usize);
+        assert_eq!(display.writes.len(), (MAX_SWITCH_ATTEMPTS * WRITE_CYCLES) as usize);
     }
 }
