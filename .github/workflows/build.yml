@@ -37,6 +37,9 @@ jobs:
   build:
     name: Build (${{ matrix.job.short_target }})
     needs: [meta]
+    # Needed by the "Release" step below to create the release and attach the packages to it.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       max-parallel: 3
