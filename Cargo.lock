@@ -360,8 +360,7 @@ dependencies = [
 [[package]]
 name = "ddc-macos"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28aca22e30b33daf41a5d269a19b00588adf5242ed5525d3818195de17a534dc"
+source = "git+https://github.com/matthewpick/ddc-macos-rs?branch=double-write#4ffec93984ef366ca75565d454403753a2afd060"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
@@ -446,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "display_switch"
-version = "1.5.3"
+version = "1.5.4"
 dependencies = [
  "anyhow",
  "clap",
