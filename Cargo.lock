@@ -360,7 +360,7 @@ dependencies = [
 [[package]]
 name = "ddc-macos"
 version = "0.2.2"
-source = "git+https://github.com/matthewpick/ddc-macos-rs?branch=double-write#4ffec93984ef366ca75565d454403753a2afd060"
+source = "git+https://github.com/matthewpick/ddc-macos-rs?branch=double-write#15d84d27784b3a462a5c82dd7426fd02497a8e30"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "display_switch"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "clap",
